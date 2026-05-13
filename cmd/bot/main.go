@@ -6,164 +6,175 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"strings"
+	"os/signal"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/mdp/qrterminal/v3" // Opcional: para mostrar o QR Code no terminal
+	// Telegram Imports
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/tg"
+
+	// WhatsApp Imports
+	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
-
-	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/protobuf/proto"
 )
 
-// Estrutura de dados que trafega entre o Telegram e o WhatsApp
-type RawMessage struct {
-	Text   string
-	Author string
+// Estrutura de dados que viaja pelo Canal (Tubo) entre o Telegram e o WhatsApp
+type BridgeMessage struct {
+	Text string
 }
 
 func main() {
-	// Variáveis de ambiente (você pode usar .env no futuro)
-	tgToken := "SEU_TOKEN_DO_TELEGRAM_AQUI"
-	waTargetGroupJID := "1234567890-123456@g.us" // ID do seu grupo no WhatsApp
+	// ==============================================
+	// ⚙️ CONFIGURAÇÕES PRINCIPAIS
+	// ==============================================
+	apiID := 38993961                             // SUBSTITUI PELO TEU API_ID DO TELEGRAM
+	apiHash := "9f58272c03543229361aab12f67d0109" // SUBSTITUI PELO TEU API_HASH DO TELEGRAM
 
-	// Canal de comunicação entre os sistemas (desacoplamento)
-	messageChannel := make(chan RawMessage, 100) // Buffer de 100 mensagens
+	targetTelegramID := int64(1930892629) // O ID do grupo do Telegram que apanhaste
 
-	// 1. Inicializa o WhatsApp (Consumidor)
+	// Substitui pelo JID do grupo do WhatsApp (ex: "123456789012345@g.us")
+	targetWhatsAppJID := "120363409829682106@g.us"
+
+	// 1. Cria o Canal de Comunicação (permite até 100 mensagens em fila)
+	messageChannel := make(chan BridgeMessage, 100)
+
+	// 2. Inicia o WhatsApp
 	waClient := setupWhatsApp()
 	defer waClient.Disconnect()
 
-	// Inicia a Goroutine do WhatsApp Dispatcher
-	go whatsappDispatcher(waClient, waTargetGroupJID, messageChannel)
+	// 3. Inicia a rotina de Envio do WhatsApp em segundo plano (Goroutine)
+	go whatsappSender(waClient, targetWhatsAppJID, messageChannel)
 
-	// 2. Inicializa o Telegram (Produtor)
-	telegramListener(tgToken, messageChannel)
+	// 4. Inicia o Telegram e bloqueia o programa para ficar a ouvir eternamente
+	startTelegramListener(apiID, apiHash, targetTelegramID, messageChannel)
 }
 
 // ==========================================
-// COMPONENTE 1: Telegram Listener
+// ➡️ COMPONENTE: DISPARADOR DO WHATSAPP
 // ==========================================
-func telegramListener(token string, msgChan chan<- RawMessage) {
-	bot, err := tgbotapi.NewBotAPI(token)
-	if err != nil {
-		log.Panic("Erro ao conectar no Telegram: ", err)
-	}
-
-	bot.Debug = false
-	log.Printf("Autorizado na conta Telegram: %s", bot.Self.UserName)
-
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := bot.GetUpdatesChan(u)
-
-	// Escuta eventos em loop
-	for update := range updates {
-		if update.Message != nil {
-			// Filtra apenas mensagens de texto (você pode expandir para imagens depois)
-			if update.Message.Text != "" {
-				log.Printf("[Telegram] Nova mensagem de %s", update.Message.From.UserName)
-
-				// Envia para o canal
-				msgChan <- RawMessage{
-					Text:   update.Message.Text,
-					Author: update.Message.From.UserName,
-				}
-			}
-		}
-	}
-}
-
-// ==========================================
-// COMPONENTE 2: Message Parser / Formatter
-// ==========================================
-func formatMessage(raw RawMessage) string {
-	// Aqui entram suas regras de negócio (Regex, substituições, etc)
-	formattedText := strings.TrimSpace(raw.Text)
-
-	// Exemplo de template
-	return fmt.Sprintf("🤖 *Encaminhado do Telegram*\n👤 *Autor:* %s\n\n%s", raw.Author, formattedText)
-}
-
-// ==========================================
-// COMPONENTE 3: WhatsApp Dispatcher
-// ==========================================
-func whatsappDispatcher(waClient *whatsmeow.Client, targetJID string, msgChan <-chan RawMessage) {
-	// Converte a string do JID para o tipo JID do whatsmeow
+func whatsappSender(client *whatsmeow.Client, targetJID string, msgChan <-chan BridgeMessage) {
 	groupJID, err := types.ParseJID(targetJID)
 	if err != nil {
-		log.Fatalf("JID do WhatsApp inválido: %v", err)
+		log.Printf("⚠️ Erro no JID do WhatsApp: %v", err)
+		return
 	}
 
-	// Consome o canal eternamente
-	for rawMsg := range msgChan {
-		// 1. Formata a mensagem
-		finalText := formatMessage(rawMsg)
+	for msg := range msgChan {
+		// 1. Formata o texto final
+		finalText := fmt.Sprintf("🤖 *Encaminhado do Telegram*\n\n%s", msg.Text)
 
-		// 2. Delay Humano (evita banimentos por spam em rajada)
-		delay := time.Duration(rand.Intn(3)+2) * time.Second
+		// 2. Atraso Humano Aleatório (evita banimentos por spamming)
+		delay := time.Duration(rand.Intn(4)+2) * time.Second
 		time.Sleep(delay)
 
-		// 3. Monta o payload e envia
-		msg := &waProto.Message{
-			Conversation: &finalText,
+		// 3. Envia a mensagem
+		waMsg := &waProto.Message{
+			Conversation: proto.String(finalText),
 		}
 
-		_, err := waClient.SendMessage(context.Background(), groupJID, msg)
+		_, err := client.SendMessage(context.Background(), groupJID, waMsg)
 		if err != nil {
-			log.Printf("[WhatsApp] Erro ao enviar mensagem: %v", err)
+			log.Printf("❌ [WhatsApp] Falha ao enviar: %v", err)
 		} else {
-			log.Printf("[WhatsApp] Mensagem enviada com sucesso para %s", targetJID)
+			log.Printf("✅ [WhatsApp] Mensagem encaminhada com sucesso para o grupo!")
 		}
 	}
 }
 
 // ==========================================
-// COMPONENTE 4: Session & State Manager
+// ⬅️ COMPONENTE: OUVINTE DO TELEGRAM
 // ==========================================
-func setupWhatsApp() *whatsmeow.Client {
-	dbLog := waLog.Stdout("Database", "WARN", true)
-	// Usa o SQLite embutido para salvar a sessão e não precisar ler QR Code toda vez
-	container, err := sqlstore.New("sqlite3", "file:wa_session.db?_foreign_keys=on", dbLog)
-	if err != nil {
-		panic(err)
-	}
+func startTelegramListener(apiID int, apiHash string, targetID int64, msgChan chan<- BridgeMessage) {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
-	deviceStore, err := container.GetFirstDevice()
-	if err != nil {
-		panic(err)
-	}
+	dispatcher := tg.NewUpdateDispatcher()
 
-	clientLog := waLog.Stdout("Client", "WARN", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
+	// Ouve apenas as mensagens de Supergrupos/Canais
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, update *tg.UpdateNewChannelMessage) error {
+		msg, ok := update.Message.(*tg.Message)
+		if ok && msg.Message != "" {
+			peer, isChannel := msg.PeerID.(*tg.PeerChannel)
 
-	if client.Store.ID == nil {
-		// Nenhuma sessão salva, precisa escanear o QR Code
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				// Mostra o QR Code no terminal. Requer a lib qrterminal
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				fmt.Println("Escaneie o QR Code acima com seu WhatsApp")
-			} else {
-				fmt.Println("Login event:", evt.Event)
+			// Se o ID da mensagem bater certo com o ID que configurámos
+			if isChannel && peer.ChannelID == targetID {
+				fmt.Printf("🔍 [Telegram] Nova mensagem detetada: %s\n", msg.Message)
+
+				// Atira a mensagem para dentro do tubo (Canal Go)
+				msgChan <- BridgeMessage{Text: msg.Message}
 			}
 		}
-	} else {
-		// Já tem sessão, apenas conecta
-		err = client.Connect()
-		if err != nil {
-			panic(err)
+		return nil
+	})
+
+	client := telegram.NewClient(apiID, apiHash, telegram.Options{
+		SessionStorage: &session.FileStorage{Path: "tg_session.json"},
+		UpdateHandler:  dispatcher,
+	})
+
+	fmt.Println("🚀 Iniciando Ponte Telegram -> WhatsApp...")
+
+	err := client.Run(ctx, func(ctx context.Context) error {
+		flow := auth.NewFlow(TerminalAuth{}, auth.SendCodeOptions{})
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			return err
 		}
+
+		user, _ := client.Self(ctx)
+		fmt.Printf("✅ Telegram conectado (UserBot): %s\n", user.Username)
+		fmt.Println("🎧 A aguardar mensagens... Pressiona Ctrl+C para desligar.")
+
+		<-ctx.Done()
+		fmt.Println("\nA desligar de forma segura...")
+		return nil
+	})
+
+	if err != nil {
+		panic(err)
+	}
+}
+
+// ==========================================
+// ⚙️ INICIALIZAÇÃO DO WHATSAPP (SESSÃO)
+// ==========================================
+func setupWhatsApp() *whatsmeow.Client {
+	dbLog := waLog.Stdout("Database", "ERROR", false) // Silenciei os logs do DB para o ecrã ficar mais limpo
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:wa_session.db?_foreign_keys=on", dbLog)
+	if err != nil {
+		panic(err)
 	}
 
+	deviceStore, err := container.GetFirstDevice(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	clientLog := waLog.Stdout("Client", "ERROR", false)
+	client := whatsmeow.NewClient(deviceStore, clientLog)
+
+	err = client.Connect()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("✅ WhatsApp conectado (usando a sessão guardada)!")
 	return client
 }
+
+// --- Funções Auxiliares de Login (Obrigatórias para a Interface compilar) ---
+type TerminalAuth struct{}
+
+func (TerminalAuth) Phone(_ context.Context) (string, error)    { return "", nil }
+func (TerminalAuth) Password(_ context.Context) (string, error) { return "", nil }
+func (TerminalAuth) AcceptTermsOfService(_ context.Context, tos tg.HelpTermsOfService) error {
+	return nil
+}
+func (TerminalAuth) SignUp(_ context.Context) (auth.UserInfo, error)            { return auth.UserInfo{}, nil }
+func (TerminalAuth) Code(_ context.Context, _ *tg.AuthSentCode) (string, error) { return "", nil }
